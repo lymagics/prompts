@@ -2,555 +2,278 @@
 
 ---
 
-## 1. Domain Model Rules
+## 1. Project Structure and Organization
 
-### 1.1 The Domain Model Is the Core
-- The domain model is the code closest to the business. Make it easy to understand and modify.
-- The domain model should have **no dependencies on infrastructure** — no ORM imports, no web framework imports, no I/O. It is pure Python objects.
-- Behavior should come first and drive storage requirements. Build the domain model before thinking about persistence.
-- Model business processes as **verbs**, not static data models of nouns.
+### 1.1 Top-Level Layout
+- Keep the project root flat: `main.py` (or `app.py`) as the entry point, `config.py` at root for configuration, `requirements.txt`, `env-example`, and a `src/` package for all application code.
+- Place the configuration module (`config.py`) at the repository root, NOT inside `src/`.
+- Place any one-off bootstrap or maintenance scripts (e.g., `populate_db.py`) at the repository root, NOT inside `src/`.
+- Ship an `env-example` file at the repository root listing every required environment variable with empty values. Never commit a real `.env`.
 
-### 1.2 Distinguish Entities from Value Objects
-- A **Value Object** is defined entirely by its attributes and is immutable. If you change an attribute, it represents a different object. Implement value objects using `@dataclass(frozen=True)` or `NamedTuple`.
-- An **Entity** has attributes that may vary over time but retains a recognizable identity. Define what uniquely identifies an entity (usually a reference or name field).
-- For entities, implement `__eq__` based on the identity attribute (e.g., `.reference`), and set `__hash__` based on that same attribute or to `None`.
-- For value objects, equality and hash are based on all value attributes. `@dataclass(frozen=True)` provides this for free.
+### 1.2 The `src/` Package
+- Organize `src/` by *type* at the top level, NOT by feature. Use subpackages such as `src/models/`, `src/services/`, `src/handlers/` (or `src/views/`), `src/schemas/`, `src/parsers/`. Place cross-cutting modules at the package root: `src/errors.py`, `src/messages.py`.
+- Within each type-directory, use one file per entity or feature (e.g., `src/models/user.py`, `src/models/budget.py`, `src/services/user.py`).
+- Place reusable, cross-cutting code (auth helpers, shared mixins, queue clients) under `src/common/`.
 
-```python
-# Value Object
-@dataclass(frozen=True)
-class OrderLine:
-    orderid: str
-    sku: str
-    qty: int
-
-# Entity
-class Batch:
-    def __init__(self, ref: str, sku: str, qty: int, eta: Optional[date]):
-        self.reference = ref
-        self.sku = sku
-        self.eta = eta
-        self._purchased_quantity = qty
-        self._allocations: Set[OrderLine] = set()
-
-    def __eq__(self, other):
-        if not isinstance(other, Batch):
-            return False
-        return other.reference == self.reference
-
-    def __hash__(self):
-        return hash(self.reference)
-```
-
-### 1.3 Not Everything Has to Be an Object
-- Python is a multiparadigm language. Let the "verbs" in your code be functions.
-- For every `FooManager`, `BarBuilder`, or `BazFactory`, there's often a more expressive `manage_foo()`, `build_bar()`, or `get_baz()` waiting to happen.
-- Use **domain service functions** for operations that don't naturally belong to an entity or value object.
-
-### 1.4 Use Python Magic Methods for Domain Semantics
-- Implement `__gt__`, `__lt__`, etc. so domain objects work naturally with `sorted()`, `min()`, `max()`.
-- Implement `__eq__` and `__hash__` to express domain equality rules.
-
-### 1.5 Use Domain Exceptions
-- Name exceptions in the ubiquitous language of the domain.
-- Domain exceptions are part of the domain model, not infrastructure.
-- Do **not** use exceptions for control flow when domain events can serve the same purpose.
-
-```python
-class OutOfStock(Exception):
-    pass
-```
-
-### 1.6 Apply SOLID Principles
-- Revisit the SOLID principles and heuristics like "has-a versus is-a" and "prefer composition over inheritance."
-- Single Responsibility Principle: if you can't describe what your function does without using words like "then" or "and," you might be violating SRP.
+### 1.3 File Naming
+- Snake_case for all Python module names.
+- Match file name to its primary entity or feature name (e.g., the `Budget` model lives in `src/models/budget.py`, the budget service in `src/services/budget.py`).
+- Test files mirror the structure of the code under test (e.g., `tests/test_services/test_budget.py` for `src/services/budget.py`), prefixed with `test_`.
 
 ---
 
-## 2. Architecture and Dependency Rules
+## 2. Application Entry Point and Factory
 
-### 2.1 Dependency Inversion Principle (DIP)
-- High-level modules (domain) should not depend on low-level modules (infrastructure). Both should depend on abstractions.
-- The domain model is the "inside" of your architecture, and dependencies flow inward to it (onion/hexagonal/ports-and-adapters architecture).
-- Your ORM should import your model, not the other way around. The domain model stays "pure" and free from infrastructure concerns.
+### 2.1 Entry Point
+- The repository-root entry module (`main.py` or `app.py`) must be minimal: load config, build the app via a factory, and run it.
+- For async applications, wrap the entry coroutine and dispatch it via `asyncio.run(main())` inside the `if __name__ == '__main__':` guard.
 
-### 2.2 Invert the ORM Dependency
-- Do **not** have model classes inherit from ORM base classes (like SQLAlchemy's `declarative_base()` or Django's `models.Model`).
-- Instead, define your schema separately and use explicit mapping (e.g., SQLAlchemy's classical mapping) so that the ORM imports the model.
-- This gives persistence ignorance: the domain model doesn't need to know anything about how data is loaded or persisted.
+### 2.2 Application Factory
+- Construct the application via a `create_app(config)` (or `create_<thing>(config)`) factory function exposed from `src/__init__.py` or `src/<thing>.py`. The factory must accept the config object as an argument — never read configuration inside the factory directly.
+- For frameworks with a router/dispatcher concept (web blueprints, bot dispatchers, queue consumers), define a parallel factory (e.g., `create_dispatcher()`) that wires up routers/handlers and returns the configured object.
+- Register all route groups, blueprints, or handler routers inside the factory. Do not perform side-effectful registration at module import time.
 
-```python
-# WRONG: Model depends on ORM
-class OrderLine(Base):
-    id = Column(Integer, primary_key=True)
-    sku = Column(String(250))
-
-# RIGHT: ORM depends on Model
-# model.py - pure Python
-@dataclass(frozen=True)
-class OrderLine:
-    orderid: str
-    sku: str
-    qty: int
-
-# orm.py - maps model to tables
-order_lines = Table('order_lines', metadata,
-    Column('id', Integer, primary_key=True, autoincrement=True),
-    Column('sku', String(255)),
-    Column('qty', Integer, nullable=False),
-    Column('orderid', String(255)),
-)
-def start_mappers():
-    mapper(model.OrderLine, order_lines)
-```
-
-### 2.3 Depend on Abstractions
-- Service-layer functions should depend on abstract repository types, not concrete ones. Use type hints like `repo: AbstractRepository`.
-- This allows tests to inject `FakeRepository` and production code to inject `SqlAlchemyRepository`.
+### 2.3 Router/Handler Grouping
+- Group routes/handlers per feature into their own module under `src/handlers/<feature>.py` (or `src/views/<feature>.py`).
+- Instantiate the router with `name=__name__` (or the framework's equivalent) so the module path becomes the router identifier.
+- Export one router per file; import and register them from the factory.
 
 ---
 
-## 3. Repository Pattern Rules
+## 3. Configuration Management
 
-### 3.1 Repository as Collection Abstraction
-- The Repository pattern is an abstraction over persistent storage, giving the illusion of an in-memory collection of objects.
-- The simplest repository has just two methods: `add()` to put a new item in the repository, and `get()` to return a previously added item. Stick rigidly to using these methods for data access in your domain and service layer.
-- Do **not** put `.save()` methods on repositories. The Unit of Work handles persistence.
-- Keep `.commit()` outside of the repository — it is the caller's responsibility (or the Unit of Work's).
+### 3.1 Library
+- Read environment variables with `environs` (`from environs import Env`). Call `env.read_env()` once at module top.
 
-### 3.2 One Aggregate = One Repository
-- The only repositories you should have are repositories that return aggregates.
-- Repositories are the main place where you enforce the convention that aggregates are the only way into your domain model.
+### 3.2 Config Object
+- Define a single `Config` class decorated with `@dataclass` listing every config field with its precise type annotation (`str`, `int`, `bool`, etc.).
+- Instantiate the dataclass once at module bottom and export it: `config = Config(KEY=env.str('KEY'), ...)`. Importers use `from config import config`.
+- Use `env.str`, `env.int`, `env.bool`, etc. — never call `os.environ.get` directly.
 
-### 3.3 Build Fakes for Testing
-- Building fakes for your abstractions is an excellent way to get design feedback: if it's hard to fake, the abstraction is probably too complicated.
-- A `FakeRepository` is typically a simple wrapper around a `set` — all methods are one-liners.
+### 3.3 Naming
+- Use ALL_CAPS for config field names.
+- Prefix project-specific env vars with the project name (e.g., `MYAPP_DATABASE_URL`) to avoid collisions; unprefixed names are acceptable only for unambiguous, broadly understood keys (e.g., `DATABASE_URL`).
 
-```python
-class FakeRepository(AbstractRepository):
-    def __init__(self, products):
-        super().__init__()
-        self._products = set(products)
-
-    def _add(self, product):
-        self._products.add(product)
-
-    def _get(self, sku):
-        return next((p for p in self._products if p.sku == sku), None)
-```
-
-### 3.4 Repository Tracks Seen Aggregates
-- The repository should track aggregates that pass through it (via a `.seen` set attribute) so that the Unit of Work can collect domain events from them after commit.
+### 3.4 Test Configuration
+- For tests, define a separate `TestConfig` class (in `tests/conftest.py` or a dedicated test config module) with hardcoded values pointing at the test database, test Redis instance, etc. Do not call `env.read_env()` for tests.
 
 ---
 
-## 4. Service Layer Rules
+## 4. Data Models (SQLAlchemy)
 
-### 4.1 Purpose of the Service Layer
-- The service layer (also called orchestration layer or use-case layer) defines the entrypoints to your system and captures the primary use cases.
-- It handles orchestration: fetching objects from repositories, performing checks, calling domain services, and persisting changes.
-- It is **not** the place for business logic — that belongs in the domain model.
+### 4.1 Library and Version
+- Use SQLAlchemy 2.0+ ORM style with `DeclarativeBase`, `Mapped`, and `mapped_column`. Do not use legacy `Column`-based declarations.
 
-### 4.2 Service Layer Functions Follow a Pattern
-Typical service-layer functions have these steps:
-1. Fetch some objects from the repository (via the UoW).
-2. Make checks or assertions about the request against the current state.
-3. Call a domain service or aggregate method.
-4. If all is well, commit (via the UoW).
+### 4.2 Async by Default
+- Prefer the async SQLAlchemy engine: `create_async_engine` + `async_sessionmaker(engine, expire_on_commit=False)`. Use the sync engine only when an external constraint (e.g., framework integration) requires it.
 
-### 4.3 Express the Service Layer API in Primitives
-- Service layer functions should accept **primitive types** (strings, ints, dates), not domain objects.
-- This decouples the service layer's clients (tests, API, CLI) from the domain model.
-- Even better: use **Command and Event dataclasses** as the service layer's input interface.
+### 4.3 Base Class and Session
+- Define a single `BaseModel(DeclarativeBase)` in `src/models/base.py` (or `src/common/models.py`). Document it with a one-line docstring (e.g., `"""Base entity."""`).
+- Create the engine and `Session` factory in the same module that defines the base, exporting both.
 
-```python
-# Good: primitives
-def allocate(orderid: str, sku: str, qty: int, uow: AbstractUnitOfWork) -> str:
-    ...
+### 4.4 One Model Per File
+- Place each model class in its own file under `src/models/` (e.g., `src/models/user.py`, `src/models/budget.py`). Do NOT group multiple unrelated models in a single file.
+- Each model class must include a one-line docstring describing the entity (e.g., `"""Telegram user entity."""`).
 
-# Even better: commands
-def allocate(cmd: commands.Allocate, uow: AbstractUnitOfWork) -> str:
-    line = OrderLine(cmd.orderid, cmd.sku, cmd.qty)
-    ...
-```
+### 4.5 Column Conventions
+- Always declare a surrogate integer primary key: `id: Mapped[int] = mapped_column(primary_key=True)`.
+- Specify explicit length for string columns: `String(64)` for short identifiers, `String(2048)` for URLs, `Text` for unbounded text.
+- Mark optional columns with `Mapped[Optional[T]]` (or `Mapped[T | None]` on Python 3.10+).
+- Foreign-key columns must always have `index=True`.
+- Unique business-key columns (usernames, slugs, tickers, external IDs) must have `unique=True` AND `index=True`.
+- Use server-side defaults (`server_default=text('false')`, `server_default=func.now()`) over Python-side defaults whenever the database can express the default.
 
-### 4.4 Keep Entrypoints Thin
-- Flask/API endpoints should be thin wrappers: parse JSON, call the service layer / message bus, return HTTP responses. No business logic.
-- The responsibilities of a web framework adapter are: per-request session management, parsing parameters, status codes, and JSON responses.
+### 4.6 Timestamps Mixin
+- For any entity that needs created/updated tracking, mix in a `TimestampedMixin` that defines `created_at` and `updated_at` via `server_default=func.now()` and `server_onupdate=func.now()`. Place the mixin in `src/common/models.py`.
+- Apply it as the first base in the inheritance list: `class User(TimestampedMixin, BaseModel): ...`.
 
-```python
-@app.route("/allocate", methods=['POST'])
-def allocate_endpoint():
-    try:
-        cmd = commands.Allocate(
-            request.json['orderid'], request.json['sku'], request.json['qty'],
-        )
-        results = messagebus.handle(cmd, unit_of_work.SqlAlchemyUnitOfWork())
-        batchref = results.pop(0)
-    except InvalidSku as e:
-        return jsonify({'message': str(e)}), 400
-    return jsonify({'batchref': batchref}), 201
-```
+### 4.7 Enumerations
+- Use `enum.StrEnum` (Python 3.11+) for string-valued enumerations stored in the database. Document the enum class with a one-line docstring (e.g., `"""Budget type choices."""`).
+- Store the value as a `String` column sized to the longest member; validate the enum at the application boundary (parser/schema), not in the column type.
+
+### 4.8 Relationships
+- Declare relationships with `Mapped[list['Other']] = relationship(back_populates='this')` on the "one" side and `Mapped['Other'] = relationship(back_populates='others')` on the "many" side.
+- Always set `back_populates` on both sides — do NOT use the single-sided `backref` shorthand.
 
 ---
 
-## 5. Unit of Work Pattern Rules
+## 5. Service Layer
 
-### 5.1 UoW as Atomic Operations Abstraction
-- The Unit of Work (UoW) is the abstraction over atomic operations. It provides a stable snapshot of the database, a way to persist all changes at once, and a simple API to persistence.
-- Implement the UoW as a **context manager** (`__enter__` / `__exit__`).
-- The default behavior on exit (without commit) is to **roll back**. This makes the software safe by default.
+### 5.1 Functions, Not Classes
+- Write service code as module-level functions, not as classes or `*Service` objects. Group related functions in `src/services/<feature>.py`.
 
-### 5.2 Require Explicit Commits
-- Prefer requiring an explicit `uow.commit()` call. Don't auto-commit on exit.
-- The default behavior is to not change anything. There's only one code path that leads to changes: total success and an explicit commit.
+### 5.2 Session Ownership
+- A service function manages its own database session via the configured `Session` factory imported from `src/models/base.py`. Do NOT require callers to pass a session in.
+- For async services: `async with Session() as session: async with session.begin(): ...` for write operations; `async with Session() as session: return await session.scalar(query)` for reads.
 
-```python
-class AbstractUnitOfWork(abc.ABC):
-    products: AbstractProductRepository
+### 5.3 Visibility
+- Functions intended for outside callers are public (no underscore prefix). Internal helpers used only within the same service module are prefixed with `_` (e.g., `_create_user`).
+- Compose public service functions out of smaller private helpers when an operation has multiple steps.
 
-    def __exit__(self, *args):
-        self.rollback()
+### 5.4 Idempotent and Composite Operations
+- When an operation is naturally idempotent ("create if not exists", "upsert"), expose it as a single public function returning a boolean or the resulting entity. Example: `create_user_if_not_exist(user_id) -> bool`.
 
-    @abc.abstractmethod
-    def commit(self):
-        raise NotImplementedError
+### 5.5 Return Types
+- Annotate all service return types. Use `Model | None` (or `Optional[Model]`) for single-entity lookups that may miss.
+- Use `Sequence[Model]` for list returns; resolve with `.scalars(...).all()`.
 
-    @abc.abstractmethod
-    def rollback(self):
-        raise NotImplementedError
-```
-
-### 5.3 UoW Provides Access to Repositories
-- The UoW gives access to repositories via attributes (e.g., `uow.products`).
-- The service layer has only one dependency: the abstract UoW.
-
-### 5.4 UoW Collects and Publishes Domain Events
-- After committing, the UoW collects new events from all aggregates that the repository has seen, and yields them for the message bus to process.
-- The UoW should have a `collect_new_events()` method that iterates over `self.products.seen` and pops events from each aggregate.
-
-```python
-def collect_new_events(self):
-    for product in self.products.seen:
-        while product.events:
-            yield product.events.pop(0)
-```
-
-### 5.5 Use UoW to Group Multiple Operations Atomically
-- If deallocate fails, don't call allocate. If allocate fails, don't commit the deallocate. The UoW ensures atomic success or failure.
+### 5.6 Query Style
+- Build queries with `select(Model).where(...)` and execute via `session.scalar(query)`, `session.scalars(query).all()`, or the async equivalents. Do NOT use the legacy `Query` API.
+- For eager loading, attach `.options(joinedload(...))` to the `select` statement.
 
 ---
 
-## 6. Aggregate Pattern Rules
+## 6. Request / Response Schemas
 
-### 6.1 Choose the Right Aggregate
-- An aggregate is a cluster of associated objects treated as a unit for data changes. It defines and enforces a consistency boundary.
-- The aggregate is the boundary where every operation ends in a consistent state.
-- Choose aggregates to be as small as possible for performance. You can change your mind over time.
+### 6.1 Schemas Are Not Models
+- Define request and response schemas in a separate module from ORM models. Use `src/schemas/<feature>.py` or `src/<feature>/schemas.py` per the project's chosen structure.
+- Schemas describe the wire format; models describe the storage format. Never reuse one for the other.
 
-### 6.2 Aggregates Are Entrypoints to the Domain
-- Think of aggregates as the "public" classes of your model, and other entities/value objects as "private."
-- Modify objects inside the aggregate only by loading the whole aggregate and calling methods on it.
+### 6.2 Naming
+- Suffix input schemas with `In`, output schemas with `Out`, and partial-update schemas with `UpdateIn`. Examples: `UserIn`, `UserOut`, `UserUpdateIn`.
+- Use `*Preview` for stripped-down list-view schemas (e.g., `CoinPreview` exposes only `name`, `ticker`, `web_slug`, `image`).
 
-### 6.3 One Aggregate Per Transaction
-- Each use case should update a **single aggregate** at a time.
-- If you need to modify two aggregates, use domain events to carry information between separate transactions.
-- Between two aggregates (or services), accept **eventual consistency**.
+### 6.3 Validation
+- Mark required input fields with `required=True`.
+- Apply length and format validators at the field level (`Length(0, 64)`, `Email()`, `URL()`).
+- For multi-field rules, use a schema-level validator (e.g., `@validates_schema`) that raises `ValidationError` with a descriptive message.
 
-### 6.4 Aggregates Record Domain Events
-- Aggregates expose a `.events` attribute (a list) that records facts about what has happened using domain event objects.
-- Events are raised at the place they occur, using only the language of the domain.
-
-```python
-class Product:
-    def __init__(self, sku: str, batches: List[Batch], version_number: int = 0):
-        self.sku = sku
-        self.batches = batches
-        self.version_number = version_number
-        self.events: List[events.Event] = []
-
-    def allocate(self, line: OrderLine) -> str:
-        try:
-            batch = next(b for b in sorted(self.batches) if b.can_allocate(line))
-            batch.allocate(line)
-            self.version_number += 1
-            self.events.append(events.Allocated(
-                orderid=line.orderid, sku=line.sku, qty=line.qty,
-                batchref=batch.reference,
-            ))
-            return batch.reference
-        except StopIteration:
-            self.events.append(events.OutOfStock(line.sku))
-            return None
-```
-
-### 6.5 Use Optimistic Concurrency with Version Numbers
-- Add a `version_number` attribute to your aggregate. Increment it on every state change.
-- Use database transaction isolation levels or `SELECT FOR UPDATE` to prevent concurrent conflicting updates.
-- Handle concurrency conflicts by retrying the failed operation.
+### 6.4 Command/Argument Parsing
+- For text-command interfaces (bots, CLIs), wrap `argparse.ArgumentParser` in a subclass that overrides `error()` to raise a domain-specific exception instead of writing to stderr and exiting. Place the base parser in `src/parsers/base.py` and one parser instance per command in `src/parsers/<command>.py`.
 
 ---
 
-## 7. Events and Message Bus Rules
+## 7. Routing and Views / Handlers
 
-### 7.1 Domain Events Are Simple Dataclasses
-- Events are value objects — pure data structures with no behavior.
-- Name events in past tense using the domain language: `Allocated`, `OutOfStock`, `BatchQuantityChanged`.
-- Events have a parent `Event` base class for type hints.
+### 7.1 Thin Controllers
+- View/handler functions are thin: parse input, call services, shape the response. They must NOT contain business logic or direct queries.
 
-```python
-@dataclass
-class Allocated(Event):
-    orderid: str
-    sku: str
-    qty: int
-    batchref: str
-```
+### 7.2 HTTP Status Codes
+- Always import status codes from the stdlib `http.HTTPStatus` enum. Never write raw integer literals (`200`, `404`) in view code.
+- Pass status codes explicitly to the response/output decorator (`status_code=HTTPStatus.CREATED`).
 
-### 7.2 Commands Are Imperative
-- Commands represent a job the system should perform. Name them with imperative mood: `Allocate`, `CreateBatch`, `ChangeBatchQuantity`.
-- A command is sent by one actor to one specific actor, expecting a particular result.
-- Commands should have exactly **one handler**. Events can have **multiple handlers**.
+### 7.3 Error Translation
+- Wrap write operations in `try / except` for known domain errors (e.g., `IntegrityError`). On the except branch: roll back the session, then `abort` with the appropriate `HTTPStatus` and a human-readable message.
+- For not-found lookups, return the result or `abort(HTTPStatus.NOT_FOUND)` inline: `return result or abort(HTTPStatus.NOT_FOUND)`.
 
-### 7.3 Different Error Handling for Commands vs Events
-- **Commands fail noisily**: if a command handler raises an exception, it bubbles up to the caller.
-- **Events fail independently**: if an event handler raises an exception, log it and continue processing other handlers. Do not let a failed event handler stop the system.
+### 7.4 View Function Naming
+- Suffix view/handler function names with `_view` or `_handler` (e.g., `create_user_view`, `start_handler`) to distinguish them from service functions.
 
-```python
-def handle_event(event, queue, uow):
-    for handler in EVENT_HANDLERS[type(event)]:
-        try:
-            handler(event, uow=uow)
-            queue.extend(uow.collect_new_events())
-        except Exception:
-            logger.exception('Exception handling event %s', event)
-            continue
-
-def handle_command(command, queue, uow):
-    try:
-        handler = COMMAND_HANDLERS[type(command)]
-        result = handler(command, uow=uow)
-        queue.extend(uow.collect_new_events())
-        return result
-    except Exception:
-        logger.exception('Exception handling command %s', command)
-        raise
-```
-
-### 7.4 The Message Bus Is the Main Entrypoint
-- The message bus routes messages (commands and events) to their appropriate handlers.
-- Everything in the system can be an event handler. API calls are commands; side effects are events.
-- The message bus maintains a queue: after each handler finishes, new events from the UoW are added to the queue and processed in order.
-
-### 7.5 Handlers Are Service Functions
-- Handlers receive a command or event and a UoW. They perform the work needed for one use case.
-- Each handler opens its own UoW context, ensuring each unit of work is small and atomic.
+### 7.5 Authentication Decorators
+- Apply authentication decorators above input/output decorators on view functions. For routes accepting multiple auth schemes, compose them via the framework's multi-auth helper.
 
 ---
 
-## 8. CQRS Rules
+## 8. Custom Exceptions
 
-### 8.1 Separate Reads from Writes
-- Functions should either modify state or answer questions, but **never both** (Command-Query Separation).
-- Write operations return 201/202 with a Location header. Read operations use separate GET endpoints.
-- Keep the distinction clear: event handlers modify state; views/queries return read-only data.
+### 8.1 Module Location
+- Define all custom exception classes in `src/errors.py`.
 
-### 8.2 Reads Don't Need the Domain Model
-- For read-only operations, it's acceptable (and often better) to use raw SQL, simple ORM queries, or denormalized read models.
-- The complexity of the domain model exists to enforce rules when changing state. Reads don't need it.
-- Don't force reads through repository and domain model abstractions if it makes them awkward.
+### 8.2 Documentation
+- Each custom exception class must include a one-line docstring stating where or how it is used. Example:
+  ```python
+  class TelegramCommandArgumentParserError(Exception):
+      """Exception used in parsers module."""
+      pass
+  ```
 
-### 8.3 Consider Separate Read Models
-- For high-performance reads, maintain a denormalized read model (a separate table or even a different data store like Redis) updated via event handlers.
-- Event handlers are a great way to manage updates to a read model. They also make it easy to change the implementation later.
-
-```python
-def add_allocation_to_read_model(event: events.Allocated, uow):
-    with uow:
-        uow.session.execute(
-            'INSERT INTO allocations_view (orderid, sku, batchref)'
-            ' VALUES (:orderid, :sku, :batchref)',
-            dict(orderid=event.orderid, sku=event.sku, batchref=event.batchref)
-        )
-        uow.commit()
-```
+### 8.3 Catch at the Boundary
+- Catch custom exceptions at the boundary (view/handler) and translate them into user-facing responses. Do NOT let them propagate to the framework.
 
 ---
 
-## 9. Testing Rules
+## 9. User-Facing Text and Messages
 
-### 9.1 Aim for a Healthy Test Pyramid
-- **Unit tests** (against service layer with fakes): the bulk of your tests. Fast, no I/O.
-- **Integration tests** (against real DB): a small number to verify repository, ORM, and UoW.
-- **End-to-end tests** (against HTTP API): aim for one per feature — just happy path and one unhappy path.
+### 9.1 Centralization
+- Centralize all user-facing strings (welcome messages, help text, success/error responses) in `src/messages.py` as module-level UPPER_CASE constants.
+- Never inline user-facing strings in handlers, services, or schemas. The only inline text allowed is exception messages intended for developers and validation error messages that include dynamic field names.
 
-### 9.2 Test at the Highest Useful Abstraction
-- Write the bulk of your tests against the service layer / message bus using `FakeUnitOfWork`.
-- Maintain a small core of domain model tests for the most complex business logic. Don't be afraid to delete these if the functionality is later covered at the service layer.
-- Every line of code in a test is like glue, holding the system in a particular shape. The more low-level tests you have, the harder it will be to change things.
-
-### 9.3 High Gear vs Low Gear
-- **Low gear** (domain model tests): when starting a new project or tackling a gnarly problem, for better feedback and executable documentation.
-- **High gear** (service layer tests): for most features and bug fixes, for lower coupling and higher coverage.
-
-### 9.4 Service-Layer Tests Should Use Only Primitives and Services
-- Service-layer tests should set up state by calling service-layer functions (e.g., `add_batch`), not by directly instantiating domain objects.
-- If you need to do domain-layer stuff directly in service-layer tests, your service layer may be incomplete.
-
-### 9.5 Prefer Fakes Over Mocks
-- Use **fakes** (working in-memory implementations) rather than **mocks** (`mock.patch`).
-- Mocks couple your tests to implementation details. Fakes test the same interface as production code.
-- "Don't mock what you don't own" — build simple abstractions over messy subsystems and fake those instead.
-- Patching out dependencies doesn't improve design. Introducing abstractions does.
-
-### 9.6 Error Handling Counts as a Feature
-- Structure your application so all errors bubble up to entrypoints and are handled uniformly.
-- Test only the happy path E2E, and reserve unit tests for unhappy path edge cases.
+### 9.2 Multi-Line Messages
+- Use triple-quoted strings for multi-line messages. Keep the leading `"""` flush with the assignment to avoid leading indentation in the rendered text.
 
 ---
 
-## 10. Dependency Injection Rules
+## 10. Authentication
 
-### 10.1 Use a Bootstrap Script
-- Create a `bootstrap.py` that wires up all dependencies: UoW, notifications, event publishers, etc.
-- The bootstrap script declares default (production) dependencies but allows overrides for tests.
-- The bootstrap script performs initialization (e.g., `orm.start_mappers()`), injects dependencies into handlers, and returns a configured message bus.
+### 10.1 Module Location
+- Place authentication helpers under `src/common/auth.py` for shared primitives (token generation, token verification). Feature-specific verification logic (e.g., password check for the users feature) lives in `src/<feature>/auth.py` or `src/users/auth.py`.
 
-```python
-def bootstrap(
-    start_orm: bool = True,
-    uow: AbstractUnitOfWork = SqlAlchemyUnitOfWork(),
-    notifications: AbstractNotifications = EmailNotifications(),
-    publish: Callable = redis_eventpublisher.publish,
-) -> MessageBus:
-    if start_orm:
-        orm.start_mappers()
-    dependencies = {'uow': uow, 'notifications': notifications, 'publish': publish}
-    injected_event_handlers = {
-        event_type: [inject_dependencies(handler, dependencies) for handler in handlers]
-        for event_type, handlers in EVENT_HANDLERS.items()
-    }
-    injected_command_handlers = {
-        command_type: inject_dependencies(handler, dependencies)
-        for command_type, handler in COMMAND_HANDLERS.items()
-    }
-    return MessageBus(uow=uow, event_handlers=injected_event_handlers,
-                      command_handlers=injected_command_handlers)
-```
+### 10.2 Token Generation
+- Implement token generation as a small pure function: `generate_jwt_token(payload: dict, secret_key: str, expires_in: int = 3600) -> str`. The function adds the `exp` claim with `datetime.now(UTC) + timedelta(seconds=expires_in)` and encodes with `HS256`.
+- Never hardcode the algorithm at multiple call sites — keep it inside the helper.
 
-### 10.2 Explicit Dependencies Over Implicit Imports
-- Prefer declaring dependencies explicitly (as function parameters) over importing them at module level and using `mock.patch` in tests.
-- Explicit is better than implicit. Declaring an explicit dependency is an example of the dependency inversion principle.
+### 10.3 Token Verification
+- Verification helpers must `abort(HTTPStatus.UNAUTHORIZED)` for: missing token, blacklisted token, decode failure (`jwt.PyJWTError`). Return the decoded payload on success.
 
-### 10.3 Use Closures or Partials for DI
-- Compose handler functions with their dependencies using `functools.partial`, closures, or callable classes.
-- The bootstrap script creates partially-applied handler functions that already have their dependencies injected.
+### 10.4 Token Revocation
+- Store revoked tokens in Redis with a TTL equal to the remaining time until the token's natural expiry. Key format: `auth_token:<token>`. Verifiers MUST check this blocklist before decoding.
+- Compute remaining TTL from the token's `exp` claim minus current epoch time; skip insertion when TTL is non-positive.
 
-### 10.4 Building Proper Adapters
-Follow these steps:
-1. Define your API using an ABC (or Protocol).
-2. Implement the real thing.
-3. Build a fake and use it for unit/service-layer/handler tests.
-4. Find a less-fake version for your Docker dev environment (e.g., MailHog for email).
-5. Test the less-fake "real" thing with integration tests.
+### 10.5 Password Storage
+- Hash passwords with the framework's password-hashing helper (e.g., `werkzeug.security.generate_password_hash`). Store the hash in a `password_hash` column. Never store plaintext.
+- On password update, verify the old password via `check_password_hash` before re-hashing the new value.
 
 ---
 
-## 11. Project Structure Rules
+## 11. Asynchronous Tasks and Messaging
 
-### 11.1 Organize by Architectural Layer
-```
-src/
-└── allocation/
-    ├── domain/          # Domain model: entities, value objects, events, commands
-    │   ├── model.py
-    │   ├── events.py
-    │   └── commands.py
-    ├── service_layer/   # Use cases, handlers, UoW, message bus
-    │   ├── handlers.py
-    │   ├── unit_of_work.py
-    │   └── messagebus.py
-    ├── adapters/        # Secondary adapters: repository, ORM, email, Redis
-    │   ├── orm.py
-    │   ├── repository.py
-    │   ├── notifications.py
-    │   └── redis_eventpublisher.py
-    ├── entrypoints/     # Primary adapters: Flask API, Redis consumer, CLI
-    │   ├── flask_app.py
-    │   └── redis_eventconsumer.py
-    ├── views.py         # Read-only query functions (CQRS)
-    ├── bootstrap.py     # Dependency injection and initialization
-    └── config.py        # Environment-based configuration
-tests/
-├── unit/                # Fast tests against fakes
-├── integration/         # Tests against real DB
-└── e2e/                 # Tests against HTTP API
-```
+### 11.1 Queue
+- For background work (email delivery, slow third-party calls), publish to RabbitMQ via `pika`. The producer lives in `src/common/<task>.py` (e.g., `src/common/email.py`) and exposes a single function that serializes the event with `json.dumps` and publishes to a named, durable queue.
 
-### 11.2 Install Source as a Package
-- Put all application code in a `src/` folder and make it pip-installable with a `setup.py`.
-- This simplifies imports and keeps tests separate from source.
+### 11.2 Connection Lifecycle
+- Open the RabbitMQ connection inside the app factory and attach it to the app context (e.g., `app.rabbitmq = pika.BlockingConnection(...)`). Gate connection setup on the presence of the config key so test environments without RabbitMQ still bring the app up:
+  ```python
+  if 'RABBITMQ_URL' in app.config:
+      app.rabbitmq = pika.BlockingConnection(pika.URLParameters(app.config['RABBITMQ_URL']))
+  else:
+      app.rabbitmq = None
+  ```
 
-### 11.3 Configuration via Environment Variables
-- Use environment variables for all configuration (12-factor app style).
-- Centralize config access in a `config.py` module with functions (not constants), so client code can modify `os.environ` if needed.
-- Provide sensible defaults for local development.
+### 11.3 Consumer Process
+- Implement consumers as separate processes under `src/<topic>/consumer.py` with a `main()` entry point that builds the app via the factory and starts `channel.start_consuming()` inside `app.app_context()`.
+- On message handling: ack on success, nack and `stop_consuming()` then re-raise on failure. Do not silently swallow exceptions.
+
+### 11.4 Queue Declaration
+- Declare queues as `durable=True` on both producer and consumer sides. Both sides must call `queue_declare` with identical arguments — declaration is idempotent and ensures the queue exists.
 
 ---
 
-## 12. Event-Driven Microservices Integration Rules
+## 12. Database Migrations and Seeding
 
-### 12.1 Use Events for Inter-Service Communication
-- Instead of synchronous HTTP API calls between services, use asynchronous events via a message broker (Redis pub/sub, Kafka, RabbitMQ, EventStore).
-- This provides temporal decoupling: services can fail independently, improving overall reliability.
-- Think in terms of verbs (ordering, allocating), not nouns (orders, batches).
+### 12.1 Migrations
+- Use Alembic for schema migrations (via the framework's integration when one exists). Commit the `migrations/` directory, including `env.py`, `script.py.mako`, and `versions/`.
 
-### 12.2 Entrypoints Translate External Messages
-- External message consumers (like a Redis subscriber) are thin adapters: deserialize JSON, create a Command, pass it to the message bus. Same pattern as Flask endpoints.
-
-### 12.3 Distinguish Internal vs External Events
-- Not all domain events should be published externally. Keep the distinction clear.
-- Outbound events are one of the places to apply validation.
-
-### 12.4 Design for Failure
-- Explicitly choose small, focused transactions that can fail independently.
-- Use retry logic with exponential backoff for transient failures (e.g., the `tenacity` library).
-- Make handlers **idempotent** so that calling them repeatedly with the same message won't make repeated changes to state.
-- You will need monitoring to know when transactions fail, and tooling to replay events.
-
-### 12.5 Microservices as Consistency Boundaries
-- Like aggregates, microservices should be consistency boundaries. Between two services, accept eventual consistency.
-- Each service accepts commands from the outside world and raises events to record results. Other services listen to those events.
+### 12.2 Bootstrap Script
+- Provide a `populate_db.py` script at the repository root that drops and recreates all tables for local development:
+  ```python
+  async def main():
+      async with engine.begin() as conn:
+          await conn.run_sync(BaseModel.metadata.drop_all)
+          await conn.run_sync(BaseModel.metadata.create_all)
+  ```
+- This script is for local development only. Production schema changes must go through Alembic.
 
 ---
 
-## 13. General Principles
+## 13. Python Conventions
 
-### 13.1 Functional Core, Imperative Shell
-- Separate what you want to do from how to do it.
-- The "functional core" contains business logic with no side effects — pure functions that take simple data structures and return simple data structures.
-- The "imperative shell" gathers inputs, calls the core, and applies outputs (I/O, DB writes, email sends).
+### 13.1 Type Hints
+- Annotate every function signature: parameters and return type. Use the modern union syntax `X | None` on Python 3.10+ in preference to `Optional[X]`.
 
-### 13.2 Abstractions Hide Messy Details
-- When choosing abstractions, ask:
-  - Can I choose a familiar Python data structure to represent the state of the messy system?
-  - Where can I draw a line between systems to insert an abstraction?
-  - What are the dependencies, and what is the core business logic?
-  - What implicit concepts can I make explicit?
+### 13.2 Imports
+- Group imports in three blocks separated by blank lines: stdlib, third-party, first-party (`src.*`, `config`, `tests.*`). Within a block, alphabetize.
+- Use absolute imports (`from src.services.user import ...`) — never relative imports across packages.
 
-### 13.3 Use the "Make the Change Easy, Then Make the Easy Change" Workflow
-- Refactor first (preparatory refactoring) to make the architecture accommodate the new requirement, then implement the requirement.
+### 13.3 String Style
+- Use single quotes for short string literals; reserve double quotes for strings that contain a single quote. Use triple double quotes for docstrings.
 
-### 13.4 CRUD Apps Don't Need These Patterns
-- If your app is just a simple CRUD wrapper around a database, you don't need a domain model, repository pattern, service layer, or any of these patterns. Use Django and save yourself the bother.
-- The more complex the domain, the more investment in separating infrastructure from business logic will pay off.
+### 13.4 Docstrings
+- Every module-level public class and function intended to be called from outside its module must have at least a one-line docstring.
+- Docstrings describe purpose, not implementation. Keep them short and declarative.
 
-### 13.5 When Adding a New Feature
-- Look for "When X, then Y" in requirements — these indicate events.
-- Don't add side effects (email, logging, notifications) into the domain model or the service layer. Use domain events and separate handlers.
-- Each new feature should map to a new command/event and handler, fitting into existing architectural patterns without requiring architectural changes.
+### 13.5 Dataclasses
+- Prefer `@dataclass` over hand-written `__init__` for simple data containers (config, DTOs, command-parsing results). Do not use dataclasses for ORM models or schemas — those have their own base classes.
 
-### 13.6 Avoid the Big Ball of Mud
-- A big ball of mud is the natural state of software, like wilderness is the natural state of a garden. It takes energy and direction to prevent collapse.
-- Chaos in software is characterized by homogeneity: every part looks the same, with API handlers doing domain logic, sending email, and performing I/O; business logic classes doing I/O; everything coupled to everything.
-- Maintain clear boundaries between layers. Business logic should never be spread across multiple layers.
+### 13.6 Async Style
+- Functions performing I/O in an async context must be `async def`. Compose async work with `async with` for resource management and `await` for results — never mix blocking calls into the async path.
+- Use an IIFE pattern only when a sync API demands a sync callback; otherwise propagate `async` up to the entry point.
