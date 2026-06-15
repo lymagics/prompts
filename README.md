@@ -10,7 +10,7 @@ Rules are project-level instructions that Claude Code automatically follows duri
 
 | Rule | Description |
 |------|-------------|
-| **[backend.md](.claude/rules/backend.md)** | Python backend architecture — domain-driven design, repository pattern, unit of work, aggregates, CQRS, event-driven messaging, dependency injection, and project structure |
+| **[backend.md](.claude/rules/backend.md)** | Python backend architecture — modular monolith with onion / ports-and-adapters layering, framework-free domain, repository pattern, unit of work, service layer, route-owned transactions, and an HTTP-only API layer |
 | **[frontend.md](.claude/rules/frontend.md)** | React application development — component design, state management, routing, API client architecture, authentication, performance optimization, and deployment |
 | **[testing.md](.claude/rules/testing.md)** | Testing philosophy — logic-free tests, fakes over mocks, test isolation, naming conventions, TDD workflow, and quality tools (Hypothesis, mutmut, PyHamcrest) |
 | **[ci.md](.claude/rules/ci.md)** | CI/CD pipeline design — modular jobs, coverage reporting with Codecov, and local reproducibility via [act](https://github.com/nektos/act) |
@@ -43,7 +43,6 @@ For more on Claude Code configuration, see the [official documentation](https://
 
 The following rules sections are based on ideas and patterns from these books:
 
-- **Backend** — [Architecture Patterns with Python](https://www.oreilly.com/library/view/architecture-patterns-with/9781492052197/) by Harry Percival and Bob Gregory
 - **Frontend** — [React Mega-Tutorial](https://learn.miguelgrinberg.com/product/react-mega-tutorial) by Miguel Grinberg
 - **Testing** — [Angry Tests](https://www.yegor256.com/angry-tests.html) by Yegor Bugayenko
 

@@ -1,279 +1,451 @@
-# Coding Rules for Python Backend Applications
+# Backend Engineering Rules
+
+These rules govern how you write backend code in this repository. Follow them exactly.
+When a general convention conflicts with a rule here, the rule here wins.
+
+The goals are **strict layering**, **a framework-free core**, and **persistence and HTTP
+concerns kept at the edges**. Every file has one job. Dependencies point inward.
 
 ---
 
-## 1. Project Structure and Organization
+## 1. Architecture
 
-### 1.1 Top-Level Layout
-- Keep the project root flat: `main.py` (or `app.py`) as the entry point, `config.py` at root for configuration, `requirements.txt`, `env-example`, and a `src/` package for all application code.
-- Place the configuration module (`config.py`) at the repository root, NOT inside `src/`.
-- Place any one-off bootstrap or maintenance scripts (e.g., `populate_db.py`) at the repository root, NOT inside `src/`.
-- Ship an `env-example` file at the repository root listing every required environment variable with empty values. Never commit a real `.env`.
+The project is a **modular monolith**. Each business capability is a self-contained
+**module** under `src/`. Shared infrastructure lives in `src/shared/`.
 
-### 1.2 The `src/` Package
-- Organize `src/` by *type* at the top level, NOT by feature. Use subpackages such as `src/models/`, `src/services/`, `src/handlers/` (or `src/views/`), `src/schemas/`, `src/parsers/`. Place cross-cutting modules at the package root: `src/errors.py`, `src/messages.py`.
-- Within each type-directory, use one file per entity or feature (e.g., `src/models/user.py`, `src/models/budget.py`, `src/services/user.py`).
-- Place reusable, cross-cutting code (auth helpers, shared mixins, queue clients) under `src/common/`.
+Each module follows an **onion / ports-and-adapters** layout. Dependencies point inward
+only — an inner layer must never import an outer layer.
 
-### 1.3 File Naming
-- Snake_case for all Python module names.
-- Match file name to its primary entity or feature name (e.g., the `Budget` model lives in `src/models/budget.py`, the budget service in `src/services/budget.py`).
-- Test files mirror the structure of the code under test (e.g., `tests/test_services/test_budget.py` for `src/services/budget.py`), prefixed with `test_`.
+```
+api  →  service  →  repository (port)  →  domain
+                          │
+                    repository (adapter) → models (ORM)
+```
 
----
+- **domain** is the center. It depends on nothing but the standard library.
+- **service** orchestrates use cases. It depends only on `domain` and repository *ports*. It does not manage transactions.
+- **repository** is a *port* (abstract) paired with an *adapter* (concrete) that talks to the database through `models`.
+- **api** is the outermost layer. It wires the request together and translates between HTTP and the domain.
 
-## 2. Application Entry Point and Factory
+**Hard rule:** `domain.py` never imports SQLAlchemy, `apiquart`, or anything under `api/`.
 
-### 2.1 Entry Point
-- The repository-root entry module (`main.py` or `app.py`) must be minimal: load config, build the app via a factory, and run it.
-- For async applications, wrap the entry coroutine and dispatch it via `asyncio.run(main())` inside the `if __name__ == '__main__':` guard.
+### Cross-module boundaries
 
-### 2.2 Application Factory
-- Construct the application via a `create_app(config)` (or `create_<thing>(config)`) factory function exposed from `src/__init__.py` or `src/<thing>.py`. The factory must accept the config object as an argument — never read configuration inside the factory directly.
-- For frameworks with a router/dispatcher concept (web blueprints, bot dispatchers, queue consumers), define a parallel factory (e.g., `create_dispatcher()`) that wires up routers/handlers and returns the configured object.
-- Register all route groups, blueprints, or handler routers inside the factory. Do not perform side-effectful registration at module import time.
-
-### 2.3 Router/Handler Grouping
-- Group routes/handlers per feature into their own module under `src/handlers/<feature>.py` (or `src/views/<feature>.py`).
-- Instantiate the router with `name=__name__` (or the framework's equivalent) so the module path becomes the router identifier.
-- Export one router per file; import and register them from the factory.
+A module may import from `shared` and from another module's `domain` or `service` only.
+Never reach into another module's `repository`, `models`, `unit_of_work`, or `api`.
 
 ---
 
-## 3. Configuration Management
+## 2. Module layout
 
-### 3.1 Library
-- Read environment variables with `environs` (`from environs import Env`). Call `env.read_env()` once at module top.
-
-### 3.2 Config Object
-- Define a single `Config` class decorated with `@dataclass` listing every config field with its precise type annotation (`str`, `int`, `bool`, etc.).
-- Instantiate the dataclass once at module bottom and export it: `config = Config(KEY=env.str('KEY'), ...)`. Importers use `from config import config`.
-- Use `env.str`, `env.int`, `env.bool`, etc. — never call `os.environ.get` directly.
-
-### 3.3 Naming
-- Use ALL_CAPS for config field names.
-- Prefix project-specific env vars with the project name (e.g., `MYAPP_DATABASE_URL`) to avoid collisions; unprefixed names are acceptable only for unambiguous, broadly understood keys (e.g., `DATABASE_URL`).
-
-### 3.4 Test Configuration
-- For tests, define a separate `TestConfig` class (in `tests/conftest.py` or a dedicated test config module) with hardcoded values pointing at the test database, test Redis instance, etc. Do not call `env.read_env()` for tests.
-
----
-
-## 4. Data Models (SQLAlchemy)
-
-### 4.1 Library and Version
-- Use SQLAlchemy 2.0+ ORM style with `DeclarativeBase`, `Mapped`, and `mapped_column`. Do not use legacy `Column`-based declarations.
-
-### 4.2 Async by Default
-- Prefer the async SQLAlchemy engine: `create_async_engine` + `async_sessionmaker(engine, expire_on_commit=False)`. Use the sync engine only when an external constraint (e.g., framework integration) requires it.
-
-### 4.3 Base Class and Session
-- Define a single `BaseModel(DeclarativeBase)` in `src/models/base.py` (or `src/common/models.py`). Document it with a one-line docstring (e.g., `"""Base entity."""`).
-- Create the engine and `Session` factory in the same module that defines the base, exporting both.
-
-### 4.4 One Model Per File
-- Place each model class in its own file under `src/models/` (e.g., `src/models/user.py`, `src/models/budget.py`). Do NOT group multiple unrelated models in a single file.
-- Each model class must include a one-line docstring describing the entity (e.g., `"""Telegram user entity."""`).
-
-### 4.5 Column Conventions
-- Always declare a surrogate integer primary key: `id: Mapped[int] = mapped_column(primary_key=True)`.
-- Specify explicit length for string columns: `String(64)` for short identifiers, `String(2048)` for URLs, `Text` for unbounded text.
-- Mark optional columns with `Mapped[Optional[T]]` (or `Mapped[T | None]` on Python 3.10+).
-- Foreign-key columns must always have `index=True`.
-- Unique business-key columns (usernames, slugs, tickers, external IDs) must have `unique=True` AND `index=True`.
-- Use server-side defaults (`server_default=text('false')`, `server_default=func.now()`) over Python-side defaults whenever the database can express the default.
-
-### 4.6 Timestamps Mixin
-- For any entity that needs created/updated tracking, mix in a `TimestampedMixin` that defines `created_at` and `updated_at` via `server_default=func.now()` and `server_onupdate=func.now()`. Place the mixin in `src/common/models.py`.
-- Apply it as the first base in the inheritance list: `class User(TimestampedMixin, BaseModel): ...`.
-
-### 4.7 Enumerations
-- Use `enum.StrEnum` (Python 3.11+) for string-valued enumerations stored in the database. Document the enum class with a one-line docstring (e.g., `"""Budget type choices."""`).
-- Store the value as a `String` column sized to the longest member; validate the enum at the application boundary (parser/schema), not in the column type.
-
-### 4.8 Relationships
-- Declare relationships with `Mapped[list['Other']] = relationship(back_populates='this')` on the "one" side and `Mapped['Other'] = relationship(back_populates='others')` on the "many" side.
-- Always set `back_populates` on both sides — do NOT use the single-sided `backref` shorthand.
+```
+src/
+    shared/
+        auth.py              # authentication helpers / decorators
+        models.py            # SQLAlchemy DeclarativeBase only
+        unit_of_work.py      # abstract UnitOfWork (port)
+    <module>/
+        api/
+            routes.py        # HTTP handlers; composition root for the request
+            schemas.py       # request/response DTOs (validation + serialization)
+        domain.py            # business entities, framework-free
+        models.py            # SQLAlchemy ORM mapping only
+        repository.py        # repository port + SQLAlchemy adapter
+        unit_of_work.py      # SQLAlchemy UnitOfWork implementation
+        service.py           # use-case orchestration, owns the transaction
+        exceptions.py        # module-specific domain exceptions
+```
 
 ---
 
-## 5. Service Layer
+## 3. Domain (`domain.py`)
 
-### 5.1 Functions, Not Classes
-- Write service code as module-level functions, not as classes or `*Service` objects. Group related functions in `src/services/<feature>.py`.
+Domain entities are pure Python. They model the business, not the database or the wire.
 
-### 5.2 Session Ownership
-- A service function manages its own database session via the configured `Session` factory imported from `src/models/base.py`. Do NOT require callers to pass a session in.
-- For async services: `async with Session() as session: async with session.begin(): ...` for write operations; `async with Session() as session: return await session.scalar(query)` for reads.
+- **Framework-free.** No SQLAlchemy, no schema library, no HTTP types.
+- **Immutable.** Use `@dataclass(frozen=True, slots=True)` (or hand-written immutable objects).
+- Entities may carry behavior that enforces their **own** invariants. Logic that spans
+  multiple entities or external systems belongs in the service, not here.
+- Constructors only assign; no I/O, no side effects.
 
-### 5.3 Visibility
-- Functions intended for outside callers are public (no underscore prefix). Internal helpers used only within the same service module are prefixed with `_` (e.g., `_create_user`).
-- Compose public service functions out of smaller private helpers when an operation has multiple steps.
+```python
+from dataclasses import dataclass
 
-### 5.4 Idempotent and Composite Operations
-- When an operation is naturally idempotent ("create if not exists", "upsert"), expose it as a single public function returning a boolean or the resulting entity. Example: `create_user_if_not_exist(user_id) -> bool`.
 
-### 5.5 Return Types
-- Annotate all service return types. Use `Model | None` (or `Optional[Model]`) for single-entity lookups that may miss.
-- Use `Sequence[Model]` for list returns; resolve with `.scalars(...).all()`.
-
-### 5.6 Query Style
-- Build queries with `select(Model).where(...)` and execute via `session.scalar(query)`, `session.scalars(query).all()`, or the async equivalents. Do NOT use the legacy `Query` API.
-- For eager loading, attach `.options(joinedload(...))` to the `select` statement.
+@dataclass(frozen=True, slots=True)
+class User:
+    id: int
+    username: str
+```
 
 ---
 
-## 6. Request / Response Schemas
+## 4. Persistence models (`models.py`)
 
-### 6.1 Schemas Are Not Models
-- Define request and response schemas in a separate module from ORM models. Use `src/schemas/<feature>.py` or `src/<feature>/schemas.py` per the project's chosen structure.
-- Schemas describe the wire format; models describe the storage format. Never reuse one for the other.
+ORM mapping **only**. No validation, no business logic, no methods beyond the mapping.
 
-### 6.2 Naming
-- Suffix input schemas with `In`, output schemas with `Out`, and partial-update schemas with `UpdateIn`. Examples: `UserIn`, `UserOut`, `UserUpdateIn`.
-- Use `*Preview` for stripped-down list-view schemas (e.g., `CoinPreview` exposes only `name`, `ticker`, `web_slug`, `image`).
+- Inherit from the shared `BaseModel`.
+- Prefix ORM classes with `Sqla` so they never get confused with domain entities
+  (`SqlaUser` vs domain `User`).
+- These classes never leave the repository. Nothing above the repository layer may
+  import or reference a `Sqla*` type.
 
-### 6.3 Validation
-- Mark required input fields with `required=True`.
-- Apply length and format validators at the field level (`Length(0, 64)`, `Email()`, `URL()`).
-- For multi-field rules, use a schema-level validator (e.g., `@validates_schema`) that raises `ValidationError` with a descriptive message.
+```python
+from sqlalchemy.orm import Mapped, mapped_column
 
-### 6.4 Command/Argument Parsing
-- For text-command interfaces (bots, CLIs), wrap `argparse.ArgumentParser` in a subclass that overrides `error()` to raise a domain-specific exception instead of writing to stderr and exiting. Place the base parser in `src/parsers/base.py` and one parser instance per command in `src/parsers/<command>.py`.
+from shared.models import BaseModel
 
----
 
-## 7. Routing and Views / Handlers
+class SqlaUser(BaseModel):
+    __tablename__ = "users"
 
-### 7.1 Thin Controllers
-- View/handler functions are thin: parse input, call services, shape the response. They must NOT contain business logic or direct queries.
+    id: Mapped[int] = mapped_column(primary_key=True)
+    username: Mapped[str] = mapped_column(unique=True)
+```
 
-### 7.2 HTTP Status Codes
-- Always import status codes from the stdlib `http.HTTPStatus` enum. Never write raw integer literals (`200`, `404`) in view code.
-- Pass status codes explicitly to the response/output decorator (`status_code=HTTPStatus.CREATED`).
+Shared base:
 
-### 7.3 Error Translation
-- Wrap write operations in `try / except` for known domain errors (e.g., `IntegrityError`). On the except branch: roll back the session, then `abort` with the appropriate `HTTPStatus` and a human-readable message.
-- For not-found lookups, return the result or `abort(HTTPStatus.NOT_FOUND)` inline: `return result or abort(HTTPStatus.NOT_FOUND)`.
+```python
+from sqlalchemy.orm import DeclarativeBase
 
-### 7.4 View Function Naming
-- Suffix view/handler function names with `_view` or `_handler` (e.g., `create_user_view`, `start_handler`) to distinguish them from service functions.
 
-### 7.5 Authentication Decorators
-- Apply authentication decorators above input/output decorators on view functions. For routes accepting multiple auth schemes, compose them via the framework's multi-auth helper.
+class BaseModel(DeclarativeBase):
+    pass
+```
 
 ---
 
-## 8. Custom Exceptions
+## 5. Repository (`repository.py`)
 
-### 8.1 Module Location
-- Define all custom exception classes in `src/errors.py`.
+The repository is the boundary between the domain and persistence. Define an **abstract
+port** and a **SQLAlchemy adapter**.
 
-### 8.2 Documentation
-- Each custom exception class must include a one-line docstring stating where or how it is used. Example:
-  ```python
-  class TelegramCommandArgumentParserError(Exception):
-      """Exception used in parsers module."""
-      pass
-  ```
+Rules:
 
-### 8.3 Catch at the Boundary
-- Catch custom exceptions at the boundary (view/handler) and translate them into user-facing responses. Do NOT let them propagate to the framework.
+- The port takes a `UnitOfWork` and declares async methods.
+- Methods accept and return **domain entities**, never ORM models. Mapping `Sqla* ↔ domain`
+  happens here and nowhere else.
+- No business logic — only retrieval, persistence, and translation.
+- The concrete adapter inherits the **port**, not `abc.ABC`.
 
----
+```python
+import abc
+from typing import Optional
 
-## 9. User-Facing Text and Messages
+from sqlalchemy import select
 
-### 9.1 Centralization
-- Centralize all user-facing strings (welcome messages, help text, success/error responses) in `src/messages.py` as module-level UPPER_CASE constants.
-- Never inline user-facing strings in handlers, services, or schemas. The only inline text allowed is exception messages intended for developers and validation error messages that include dynamic field names.
+from shared.unit_of_work import UnitOfWork
+from .domain import User
+from .models import SqlaUser
 
-### 9.2 Multi-Line Messages
-- Use triple-quoted strings for multi-line messages. Keep the leading `"""` flush with the assignment to avoid leading indentation in the rendered text.
 
----
+class UserRepository(abc.ABC):
+    def __init__(self, unit_of_work: UnitOfWork) -> None:
+        self.uow = unit_of_work
 
-## 10. Authentication
+    @abc.abstractmethod
+    async def get(self, user_id: int) -> Optional[User]:
+        raise NotImplementedError
 
-### 10.1 Module Location
-- Place authentication helpers under `src/common/auth.py` for shared primitives (token generation, token verification). Feature-specific verification logic (e.g., password check for the users feature) lives in `src/<feature>/auth.py` or `src/users/auth.py`.
+    @abc.abstractmethod
+    async def add(self, user: User) -> None:
+        raise NotImplementedError
 
-### 10.2 Token Generation
-- Implement token generation as a small pure function: `generate_jwt_token(payload: dict, secret_key: str, expires_in: int = 3600) -> str`. The function adds the `exp` claim with `datetime.now(UTC) + timedelta(seconds=expires_in)` and encodes with `HS256`.
-- Never hardcode the algorithm at multiple call sites — keep it inside the helper.
 
-### 10.3 Token Verification
-- Verification helpers must `abort(HTTPStatus.UNAUTHORIZED)` for: missing token, blacklisted token, decode failure (`jwt.PyJWTError`). Return the decoded payload on success.
+class SqlaUserRepository(UserRepository):
+    async def get(self, user_id: int) -> Optional[User]:
+        stmt = select(SqlaUser).where(SqlaUser.id == user_id)
+        row = (await self.uow.session.execute(stmt)).scalar_one_or_none()
+        if row is None:
+            return None
+        return User(id=row.id, username=row.username)
 
-### 10.4 Token Revocation
-- Store revoked tokens in Redis with a TTL equal to the remaining time until the token's natural expiry. Key format: `auth_token:<token>`. Verifiers MUST check this blocklist before decoding.
-- Compute remaining TTL from the token's `exp` claim minus current epoch time; skip insertion when TTL is non-positive.
+    async def add(self, user: User) -> None:
+        self.uow.session.add(SqlaUser(id=user.id, username=user.username))
+```
 
-### 10.5 Password Storage
-- Hash passwords with the framework's password-hashing helper (e.g., `werkzeug.security.generate_password_hash`). Store the hash in a `password_hash` column. Never store plaintext.
-- On password update, verify the old password via `check_password_hash` before re-hashing the new value.
-
----
-
-## 11. Asynchronous Tasks and Messaging
-
-### 11.1 Queue
-- For background work (email delivery, slow third-party calls), publish to RabbitMQ via `pika`. The producer lives in `src/common/<task>.py` (e.g., `src/common/email.py`) and exposes a single function that serializes the event with `json.dumps` and publishes to a named, durable queue.
-
-### 11.2 Connection Lifecycle
-- Open the RabbitMQ connection inside the app factory and attach it to the app context (e.g., `app.rabbitmq = pika.BlockingConnection(...)`). Gate connection setup on the presence of the config key so test environments without RabbitMQ still bring the app up:
-  ```python
-  if 'RABBITMQ_URL' in app.config:
-      app.rabbitmq = pika.BlockingConnection(pika.URLParameters(app.config['RABBITMQ_URL']))
-  else:
-      app.rabbitmq = None
-  ```
-
-### 11.3 Consumer Process
-- Implement consumers as separate processes under `src/<topic>/consumer.py` with a `main()` entry point that builds the app via the factory and starts `channel.start_consuming()` inside `app.app_context()`.
-- On message handling: ack on success, nack and `stop_consuming()` then re-raise on failure. Do not silently swallow exceptions.
-
-### 11.4 Queue Declaration
-- Declare queues as `durable=True` on both producer and consumer sides. Both sides must call `queue_declare` with identical arguments — declaration is idempotent and ensures the queue exists.
+> Note: the SQLAlchemy adapter assumes a SQLAlchemy-backed unit of work (it uses
+> `uow.session`). Under `mypy --strict`, either type the adapter's `uow` as the concrete
+> `SqlaUnitOfWork`, or expose `session` through a `Protocol`.
 
 ---
 
-## 12. Database Migrations and Seeding
+## 6. Unit of Work (`unit_of_work.py`)
 
-### 12.1 Migrations
-- Use Alembic for schema migrations (via the framework's integration when one exists). Commit the `migrations/` directory, including `env.py`, `script.py.mako`, and `versions/`.
+The unit of work owns the transaction boundary. The abstract port lives in `shared`; each
+module provides a concrete implementation.
 
-### 12.2 Bootstrap Script
-- Provide a `populate_db.py` script at the repository root that drops and recreates all tables for local development:
-  ```python
-  async def main():
-      async with engine.begin() as conn:
-          await conn.run_sync(BaseModel.metadata.drop_all)
-          await conn.run_sync(BaseModel.metadata.create_all)
-  ```
-- This script is for local development only. Production schema changes must go through Alembic.
+Rules:
+
+- The engine and session factory are created **once at application startup** and reused.
+  **Never create an engine per request** — an engine owns a connection pool.
+- The UoW receives the **session factory**, not a database URL.
+- It is an async context manager. The session is opened in `__aenter__` and closed in `__aexit__`.
+- `__aexit__` rolls back unconditionally. After an explicit `commit()`, the rollback is a
+  no-op; on any exception or early exit, it cleans up.
+
+Abstract port (`shared/unit_of_work.py`):
+
+```python
+import abc
+
+
+class UnitOfWork(abc.ABC):
+    @abc.abstractmethod
+    async def commit(self) -> bool:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    async def rollback(self) -> bool:
+        raise NotImplementedError
+```
+
+SQLAlchemy implementation (`<module>/unit_of_work.py`):
+
+```python
+from typing import Self
+
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+
+from shared.unit_of_work import UnitOfWork
+
+
+class SqlaUnitOfWork(UnitOfWork):
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._session_factory = session_factory
+
+    async def __aenter__(self) -> Self:
+        self.session = self._session_factory()
+        return self
+
+    async def __aexit__(self, *exc) -> None:
+        await self.rollback()
+        await self.session.close()
+
+    async def commit(self) -> bool:
+        await self.session.commit()
+        return True
+
+    async def rollback(self) -> bool:
+        await self.session.rollback()
+        return True
+```
+
+The session factory is built at startup and stored on the app:
+
+```python
+engine = create_async_engine(app.config["DATABASE_URL"])
+app.extensions["session_factory"] = async_sessionmaker(engine, expire_on_commit=False)
+```
 
 ---
 
-## 13. Python Conventions
+## 7. Service (`service.py`)
 
-### 13.1 Type Hints
-- Annotate every function signature: parameters and return type. Use the modern union syntax `X | None` on Python 3.10+ in preference to `Optional[X]`.
+The service is the use-case layer. It enforces business rules and coordinates repositories.
+It does **not** manage transactions.
 
-### 13.2 Imports
-- Group imports in three blocks separated by blank lines: stdlib, third-party, first-party (`src.*`, `config`, `tests.*`). Within a block, alphabetize.
-- Use absolute imports (`from src.services.user import ...`) — never relative imports across packages.
+Rules:
 
-### 13.3 String Style
-- Use single quotes for short string literals; reserve double quotes for strings that contain a single quote. Use triple double quotes for docstrings.
+- Depends on repository **ports** only. Never on the `UnitOfWork`, concrete adapters,
+  SQLAlchemy, or HTTP.
+- **Never commits or rolls back.** The transaction is the caller's responsibility — the
+  route opens the `UnitOfWork` scope and commits after a successful write (see §9).
+- Raises **domain exceptions** from `exceptions.py`. Returns domain entities.
+- Constructors only assign dependencies.
 
-### 13.4 Docstrings
-- Every module-level public class and function intended to be called from outside its module must have at least a one-line docstring.
-- Docstrings describe purpose, not implementation. Keep them short and declarative.
+```python
+from .domain import User
+from .repository import UserRepository
+from .exceptions import UserNotFoundError
 
-### 13.5 Dataclasses
-- Prefer `@dataclass` over hand-written `__init__` for simple data containers (config, DTOs, command-parsing results). Do not use dataclasses for ORM models or schemas — those have their own base classes.
 
-### 13.6 Async Style
-- Functions performing I/O in an async context must be `async def`. Compose async work with `async with` for resource management and `await` for results — never mix blocking calls into the async path.
-- Use an IIFE pattern only when a sync API demands a sync callback; otherwise propagate `async` up to the entry point.
+class UserService:
+    def __init__(self, user_repository: UserRepository) -> None:
+        self._users = user_repository
+
+    async def get_user(self, user_id: int) -> User:
+        user = await self._users.get(user_id)
+        if user is None:
+            raise UserNotFoundError(f"User with {user_id=} not found")
+        return user
+
+    async def register_user(self, user: User) -> User:
+        await self._users.add(user)
+        return user
+```
+
+---
+
+## 8. Exceptions (`exceptions.py`)
+
+- Each module defines a **base exception**; specific exceptions inherit it.
+- Services and the domain raise these. They are plain exceptions — no HTTP status codes,
+  no framework coupling.
+- Only the **api layer** catches them and maps them to HTTP responses.
+
+```python
+class UserError(Exception):
+    """Base error for the user module."""
+
+
+class UserNotFoundError(UserError):
+    pass
+```
+
+---
+
+## 9. API layer (`api/`)
+
+### `schemas.py`
+
+Request and response DTOs as **pydantic** models (apiquart uses pydantic). They validate
+and serialize at the HTTP boundary **only**.
+
+- Schemas never leak below the api layer. The service, repository, and domain must not
+  import them.
+- No business logic in schemas.
+
+```python
+from pydantic import BaseModel
+
+
+class UserIn(BaseModel):
+    username: str
+
+
+class UserOut(BaseModel):
+    id: int
+    username: str
+```
+
+### `routes.py`
+
+Thin HTTP handlers. The route is the **composition root for the request**: it opens the
+unit of work, builds the adapter repository, builds the service, and translates domain
+exceptions into HTTP errors. The route **owns the transaction**.
+
+Rules:
+
+- No business logic in routes — delegate to the service.
+- Open the UoW with `async with` so rollback/cleanup is automatic.
+- After a successful **mutating** use case, call `await uow.commit()` inside the UoW scope.
+  Read-only routes never commit.
+- Catch **domain exceptions** here and convert them with `abort`. Do this nowhere else.
+- Return domain entities; let the output schema serialize them.
+
+Read (no commit):
+
+```python
+from apiquart import APIBlueprint, HTTPStatus, abort
+from quart import current_app
+
+from .schemas import UserOut
+from ..service import UserService
+from ..repository import SqlaUserRepository
+from ..unit_of_work import SqlaUnitOfWork
+from ..exceptions import UserNotFoundError
+
+bp = APIBlueprint(__name__, tags=["Users"])
+
+
+@bp.get("/users/<int:user_id>")
+@bp.output(UserOut)
+async def get_user(user_id: int):
+    session_factory = current_app.extensions["session_factory"]
+    try:
+      async with SqlaUnitOfWork(session_factory) as uow:
+          repository = SqlaUserRepository(uow)
+          service = UserService(repository)
+          return await service.get_user(user_id)
+    except UserNotFoundError as error:
+        abort(HTTPStatus.NOT_FOUND, message=str(error))
+```
+
+Write (route commits after the service call succeeds):
+
+```python
+@bp.post("/users")
+@bp.input(UserIn)
+@bp.output(UserOut, status_code=HTTPStatus.CREATED)
+async def create_user(data: dict):
+    session_factory = current_app.extensions["session_factory"]
+    async with SqlaUnitOfWork(session_factory) as uow:
+        repository = SqlaUserRepository(uow)
+        service = UserService(repository)
+        user = await service.register_user(User(**data))
+        await uow.commit()
+        return user
+```
+
+> If the wiring repeats across many routes, extract a small per-module factory
+> (e.g. `build_user_service(uow) -> UserService`) to assemble the service. Keep the UoW
+> scope in the route.
+
+---
+
+## 10. Shared module (`shared/`)
+
+- `auth.py` — authentication helpers and decorators.
+- `models.py` — the SQLAlchemy `DeclarativeBase` (`BaseModel`) only.
+- `unit_of_work.py` — the abstract `UnitOfWork` port.
+
+`shared` must not depend on any module.
+
+---
+
+## 11. Request lifecycle (mental model)
+
+1. Request hits the **route**.
+2. The input schema validates the incoming data.
+3. The route opens the **UnitOfWork**, builds the **adapter repository**, builds the **service**.
+4. The **service** executes the use case against repository **ports**, enforces business
+   rules, and raises domain exceptions. It does not commit.
+5. The **repository** maps `Sqla* ↔ domain`.
+6. The **route** commits the UnitOfWork after a successful write, catches domain exceptions
+   → HTTP errors, and the output schema serializes the returned domain entity.
+
+---
+
+## 12. Dependency rules (quick reference)
+
+| File              | May import                                                              |
+| ----------------- | ----------------------------------------------------------------------- |
+| `domain.py`       | standard library only                                                   |
+| `models.py`       | `shared.models`, SQLAlchemy                                             |
+| `repository.py`   | `shared.unit_of_work`, `.domain`, `.models`, SQLAlchemy                 |
+| `unit_of_work.py` | `shared.unit_of_work`, SQLAlchemy                                       |
+| `exceptions.py`   | standard library only                                                   |
+| `service.py`      | `.domain`, `.repository` (ports), `.exceptions`                          |
+| `api/schemas.py`  | pydantic (apiquart's schema layer)                                      |
+| `api/routes.py`   | the whole module + `shared` + apiquart                                  |
+
+---
+
+## 13. Code quality
+
+- **Type everything.** Code must pass `mypy --strict`. No bare `Any`, no untyped defs.
+- **Async all the way down.** No blocking/sync database calls in the request path.
+- **Immutable domain objects.** Prefer frozen dataclasses.
+- **Constructors only assign** dependencies — no logic, no I/O in `__init__`.
+- **Composition over inheritance.** Inheritance is reserved for ports → adapters and
+  declared base classes.
+- **One public responsibility per class.**
+- **Name by role:** domain `User`, ORM `SqlaUser`, port `UserRepository`, adapter `SqlaUserRepository`.
+- `Optional` is acceptable at the repository boundary for "not found"; in the **service**,
+  prefer raising a domain exception over returning `None`.
+- Keep functions small and intention-revealing.
+
+---
+
+## 14. Anti-patterns — reject these
+
+- Returning a `Sqla*` ORM model from a service or route.
+- Business logic or validation in `models.py` or `schemas.py`.
+- Using a SQLAlchemy `session` anywhere above the repository.
+- Creating an engine (or session factory) per request.
+- `domain.py` importing a framework.
+- Catching domain exceptions outside the api layer.
+- Importing another module's `repository`, `models`, or `api`.
+- A service that imports or commits the `UnitOfWork`.
+- A write route that doesn't commit the unit of work (the change is silently rolled back on exit).
